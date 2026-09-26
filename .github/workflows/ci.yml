@@ -1,0 +1,95 @@
+﻿# =============================================================================
+# ci.yml -- Continuous Integration Pipeline for HeatNote
+# =============================================================================
+# GitHub reads every .yml file inside .github/workflows/ automatically.
+# This file defines a pipeline that runs on GitHub cloud servers (for free)
+# every time you push code or open a pull request.
+#
+# What this pipeline does, in order:
+#   1. Checks out your code onto a fresh GitHub cloud server
+#   2. Recreates gitignored config files from encrypted GitHub Secrets
+#   3. Builds your Docker image
+#   4. Scans the image for known security vulnerabilities (Trivy)
+#   5. Fails loudly if any CRITICAL or HIGH vulnerabilities are found
+# =============================================================================
+
+name: CI Pipeline
+
+# on: defines WHEN this pipeline is triggered.
+on:
+  # Trigger on every push to the main branch.
+  push:
+    branches: [main]
+  # Trigger on every pull request targeting main.
+  # Catches problems BEFORE code merges, not after.
+  pull_request:
+    branches: [main]
+
+# jobs: the actual work. Each job runs on a separate virtual machine.
+jobs:
+
+  build-and-scan:
+    name: Build & Security Scan
+    # ubuntu-latest is the standard CI server -- fast, free, Docker pre-installed.
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # Step 1: Clone your repository onto the CI server.
+      # Without this, the server has no idea what your project contains.
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Recreate gitignored config files from GitHub Secrets.
+      # firebase-config.js and cloudinary.js are in .gitignore (not in git).
+      # But the Dockerfile needs them to exist when it runs COPY.
+      #
+      # GitHub Secrets are encrypted variables you store in:
+      #   GitHub repo -> Settings -> Secrets and variables -> Actions -> New secret
+      #
+      # ${{ secrets.SECRET_NAME }} reads an encrypted secret at runtime.
+      # The value is NEVER printed in logs -- GitHub automatically masks it.
+      #
+      # ACTION REQUIRED: Create these two secrets in your GitHub repo settings:
+      #   FIREBASE_CONFIG_JS  -> paste the full contents of your firebase-config.js
+      #   CLOUDINARY_JS       -> paste the full contents of your cloudinary.js
+      - name: Restore gitignored config files from secrets
+        env:
+          FIREBASE_CONFIG: ${{ secrets.FIREBASE_CONFIG_JS }}
+          CLOUDINARY_CONFIG: ${{ secrets.CLOUDINARY_JS }}
+        run: |
+          echo "$FIREBASE_CONFIG" > firebase-config.js
+          echo "$CLOUDINARY_CONFIG" > cloudinary.js
+
+      # Step 3: Set up Docker Buildx -- the modern Docker build engine.
+      # Supports multi-platform builds and better caching vs the old builder.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Step 4: Build the Docker image from your Dockerfile.
+      # push: false  -- build but do NOT push to a registry yet (CI only)
+      # load: true   -- make the built image available to the next step
+      # tags         -- github.sha is the git commit hash (e.g. a3f8c21d)
+      #                 Every build is uniquely traceable to the exact code.
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: heatnote:${{ github.sha }}
+
+      # Step 5: Scan the built image for known CVEs using Trivy (Aqua Security).
+      # Trivy checks every OS package and library against a CVE database.
+      #
+      # exit-code: 1  -- FAIL the pipeline if vulnerabilities are found.
+      #                  This is the "gate" -- bad code cannot proceed.
+      # severity      -- only block on CRITICAL or HIGH.
+      #                  MEDIUM/LOW are reported but don't stop deployment.
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: heatnote:${{ github.sha }}
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH

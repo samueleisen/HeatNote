@@ -1,2 +1,4 @@
 cloudinary.js
 firebase-config.js
+thoughttoignore.md
+.env
