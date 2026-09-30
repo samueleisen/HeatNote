@@ -118,45 +118,64 @@ jobs:
           docker push "${IMAGE_NAME}:latest"
 
 # =============================================================================
-# Job 2: Deploy (CD)
+# Job 2: Deploy (CD) -- DISABLED until AWS VPS is ready
+# =============================================================================
+# HOW TO ENABLE when your AWS EC2 instance is set up:
+#
+#   Step 1 -- GitHub repo -> Settings -> Variables -> Actions -> New variable:
+#               Name:  DEPLOY_ENABLED
+#               Value: true
+#
+#   Step 2 -- GitHub repo -> Settings -> Secrets -> Actions -> Add these 3 secrets:
+#               SSH_HOST        -> Your EC2 public IP or domain (e.g. 13.250.x.x)
+#               SSH_USER        -> ubuntu  (default AWS EC2 user for Ubuntu AMI)
+#               SSH_PRIVATE_KEY -> Contents of your ~/.ssh/heatnote_deploy private key
+#
+#   Step 3 -- On your EC2 instance, place docker-compose.prod.yml at /opt/heatnote/
+#               mkdir -p /opt/heatnote
+#               # copy docker-compose.prod.yml there (scp or paste manually)
+#
+#   Step 4 -- Uncomment the entire deploy job block below (remove the leading #)
+#
+# WHY vars.DEPLOY_ENABLED and not secrets.SSH_HOST:
+#   GitHub Actions does NOT allow the `secrets` context in job-level `if:` conditions.
+#   It IS allowed in step-level `if:` and `run:` blocks.
+#   The `vars` context (non-sensitive config flags) IS available at job level.
+#   So we use a vars flag as the gate, and secrets only inside the steps.
 # =============================================================================
 
-  deploy:
-    name: Deploy to VPS
-    runs-on: ubuntu-latest
-
-    # Wait for build-and-scan to finish successfully before running.
-    # If CI fails (Trivy found CVEs, or the Docker build broke), this job
-    # is skipped entirely. Bad code cannot be deployed.
-    needs: build-and-scan
-
-    # Only deploy on direct pushes to main -- NOT on pull requests.
-    # PRs should be validated (CI) but never deployed.
-    # This is the "Continuous Delivery" model: only merged code ships.
-    # SSH_HOST guard: skip gracefully if VPS secrets haven't been added yet.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.SSH_HOST != ''
-
-    steps:
-
-      # SSH into the VPS and run:
-      #   1. docker pull  -> download the exact image that just passed CI
-      #   2. docker compose up -d -> restart container with the new commit SHA
-      #
-      # Required GitHub Secrets (repo -> Settings -> Secrets and variables -> Actions):
-      #   SSH_HOST        -> Your VPS IP address or domain (e.g. 123.45.67.89)
-      #   SSH_USER        -> SSH username on the VPS (e.g. ubuntu, root, deploy)
-      #   SSH_PRIVATE_KEY -> The full private key (~/.ssh/id_rsa or id_ed25519)
-      #                      that has access to the VPS
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          # NOTE: Adjust /opt/heatnote to wherever docker-compose.prod.yml lives on your VPS.
-          script: |
-            IMAGE_NAME=$(echo "ghcr.io/${{ github.repository_owner }}/heatnote" | tr '[:upper:]' '[:lower:]')
-            docker pull "${IMAGE_NAME}:${{ github.sha }}"
-            HEATNOTE_TAG=${{ github.sha }} docker compose -f /opt/heatnote/docker-compose.prod.yml up -d
-            echo "Successfully deployed HeatNote commit: ${{ github.sha }}"
+#  deploy:
+#    name: Deploy to VPS
+#    runs-on: ubuntu-latest
+#
+#    # Wait for build-and-scan to pass. If CI fails, this job is skipped entirely.
+#    needs: build-and-scan
+#
+#    # Only deploy on direct pushes to main (not PRs).
+#    # vars.DEPLOY_ENABLED must be set to 'true' in GitHub repo Variables.
+#    # See HOW TO ENABLE checklist above.
+#    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+#
+#    steps:
+#
+#      # SSH into the EC2 instance and:
+#      #   1. docker pull  -> download the exact image that just passed CI from GHCR
+#      #   2. docker compose up -d -> restart container with the new image
+#      #
+#      # Required GitHub Secrets:
+#      #   SSH_HOST        -> EC2 public IP or domain
+#      #   SSH_USER        -> ubuntu (default for AWS Ubuntu AMI)
+#      #   SSH_PRIVATE_KEY -> Private key with access to the EC2 instance
+#      - name: Deploy via SSH
+#        uses: appleboy/ssh-action@v1.0.3
+#        with:
+#          host: ${{ secrets.SSH_HOST }}
+#          username: ${{ secrets.SSH_USER }}
+#          key: ${{ secrets.SSH_PRIVATE_KEY }}
+#          # Adjust /opt/heatnote if you placed docker-compose.prod.yml elsewhere on EC2.
+#          script: |
+#            IMAGE_NAME=$(echo "ghcr.io/${{ github.repository_owner }}/heatnote" | tr '[:upper:]' '[:lower:]')
+#            docker pull "${IMAGE_NAME}:${{ github.sha }}"
+#            HEATNOTE_TAG=${{ github.sha }} docker compose -f /opt/heatnote/docker-compose.prod.yml up -d
+#            echo "Successfully deployed HeatNote commit: ${{ github.sha }}"
 
