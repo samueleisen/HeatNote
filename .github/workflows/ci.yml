@@ -1,58 +1,56 @@
-﻿# =============================================================================
-# ci.yml -- Continuous Integration Pipeline for HeatNote
 # =============================================================================
-# GitHub reads every .yml file inside .github/workflows/ automatically.
-# This file defines a pipeline that runs on GitHub cloud servers (for free)
-# every time you push code or open a pull request.
+# ci.yml -- CI/CD Pipeline for HeatNote
+# =============================================================================
+# This file defines two jobs:
 #
-# What this pipeline does, in order:
-#   1. Checks out your code onto a fresh GitHub cloud server
-#   2. Recreates gitignored config files from encrypted GitHub Secrets
-#   3. Builds your Docker image
-#   4. Scans the image for known security vulnerabilities (Trivy)
-#   5. Fails loudly if any CRITICAL or HIGH vulnerabilities are found
+#   1. build-and-scan  (CI)
+#      Runs on every push AND every pull request to main.
+#      Builds the Docker image, scans it with Trivy, and if clean,
+#      pushes it to GitHub Container Registry (GHCR).
+#
+#   2. deploy  (CD)
+#      Runs ONLY on direct pushes to main (not on PRs).
+#      Waits for build-and-scan to succeed, then SSHes into the VPS
+#      and tells it to pull the new image and restart the container.
+#
+# The split is intentional:
+#   - PRs get validated (CI) but never deployed.
+#   - Only code that lands on main gets shipped.
 # =============================================================================
 
-name: CI Pipeline
+name: CI/CD Pipeline
 
-# on: defines WHEN this pipeline is triggered.
 on:
-  # Trigger on every push to the main branch.
   push:
     branches: [main]
-  # Trigger on every pull request targeting main.
-  # Catches problems BEFORE code merges, not after.
   pull_request:
     branches: [main]
 
-# jobs: the actual work. Each job runs on a separate virtual machine.
+# Permissions required for GITHUB_TOKEN to push container images to GHCR
+permissions:
+  contents: read
+  packages: write
+
+# =============================================================================
+# Job 1: Build & Security Scan (CI)
+# =============================================================================
 jobs:
 
   build-and-scan:
     name: Build & Security Scan
-    # ubuntu-latest is the standard CI server -- fast, free, Docker pre-installed.
     runs-on: ubuntu-latest
 
     steps:
 
-      # Step 1: Clone your repository onto the CI server.
-      # Without this, the server has no idea what your project contains.
+      # Step 1: Clone the repo onto the fresh GitHub runner VM.
       - name: Checkout code
         uses: actions/checkout@v4
 
       # Step 2: Recreate gitignored config files from GitHub Secrets.
-      # firebase-config.js and cloudinary.js are in .gitignore (not in git).
-      # But the Dockerfile needs them to exist when it runs COPY.
-      #
-      # GitHub Secrets are encrypted variables you store in:
-      #   GitHub repo -> Settings -> Secrets and variables -> Actions -> New secret
-      #
-      # ${{ secrets.SECRET_NAME }} reads an encrypted secret at runtime.
-      # The value is NEVER printed in logs -- GitHub automatically masks it.
-      #
-      # ACTION REQUIRED: Create these two secrets in your GitHub repo settings:
-      #   FIREBASE_CONFIG_JS  -> paste the full contents of your firebase-config.js
-      #   CLOUDINARY_JS       -> paste the full contents of your cloudinary.js
+      # firebase-config.js and cloudinary.js contain API keys -- they are
+      # never committed to git, but the Dockerfile needs them at build time.
+      # Store the file contents as secrets in:
+      #   GitHub repo -> Settings -> Secrets and variables -> Actions
       - name: Restore gitignored config files from secrets
         env:
           FIREBASE_CONFIG: ${{ secrets.FIREBASE_CONFIG_JS }}
@@ -61,16 +59,28 @@ jobs:
           echo "$FIREBASE_CONFIG" > firebase-config.js
           echo "$CLOUDINARY_CONFIG" > cloudinary.js
 
-      # Step 3: Set up Docker Buildx -- the modern Docker build engine.
-      # Supports multi-platform builds and better caching vs the old builder.
+      # Step 3: Log in to GitHub Container Registry (GHCR).
+      # GITHUB_TOKEN is an automatic secret -- GitHub provides it for free on
+      # every run. No manual setup needed. It expires when the job ends.
+      # Format: ghcr.io/GITHUB_USERNAME/REPO_NAME
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 4: Set up Docker Buildx -- the modern Docker build engine.
+      # Supports multi-platform builds and better layer caching vs the old builder.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Step 4: Build the Docker image from your Dockerfile.
-      # push: false  -- build but do NOT push to a registry yet (CI only)
-      # load: true   -- make the built image available to the next step
-      # tags         -- github.sha is the git commit hash (e.g. a3f8c21d)
-      #                 Every build is uniquely traceable to the exact code.
+      # Step 5: Build the Docker image.
+      # push: false  -> build and load into local Docker daemon, do NOT push yet.
+      #                 We scan it first. Bad images must never reach the registry.
+      # load: true   -> makes the image available to the next step (Trivy scan).
+      # tags         -> github.sha is the full 40-char commit hash.
+      #                 Every image is uniquely traceable to the exact code version.
       - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
@@ -79,13 +89,11 @@ jobs:
           load: true
           tags: heatnote:${{ github.sha }}
 
-      # Step 5: Scan the built image for known CVEs using Trivy (Aqua Security).
-      # Trivy checks every OS package and library against a CVE database.
-      #
-      # exit-code: 1  -- FAIL the pipeline if vulnerabilities are found.
-      #                  This is the "gate" -- bad code cannot proceed.
-      # severity      -- only block on CRITICAL or HIGH.
-      #                  MEDIUM/LOW are reported but don't stop deployment.
+      # Step 6: Scan the built image for known CVEs using Trivy (Aqua Security).
+      # exit-code: 1  -> FAIL the pipeline if vulnerabilities are found.
+      #                  This is the security gate -- bad images cannot proceed.
+      # severity      -> Only block on CRITICAL or HIGH.
+      #                  MEDIUM/LOW are still reported but do not stop deployment.
       - name: Run Trivy vulnerability scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -93,3 +101,62 @@ jobs:
           format: table
           exit-code: 1
           severity: CRITICAL,HIGH
+
+      # Step 7: Tag and push vetted image to GHCR.
+      # Runs ONLY on direct pushes to main (never on PRs).
+      # Two tags are pushed:
+      #   :<commit-sha> -> permanent, unique, traceable to the exact commit
+      #   :latest       -> always points to the most recent successful build on main
+      # Note: Docker repository names MUST be strictly lowercase.
+      - name: Tag and push image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          IMAGE_NAME=$(echo "ghcr.io/${{ github.repository_owner }}/heatnote" | tr '[:upper:]' '[:lower:]')
+          docker tag heatnote:${{ github.sha }} "${IMAGE_NAME}:${{ github.sha }}"
+          docker tag heatnote:${{ github.sha }} "${IMAGE_NAME}:latest"
+          docker push "${IMAGE_NAME}:${{ github.sha }}"
+          docker push "${IMAGE_NAME}:latest"
+
+# =============================================================================
+# Job 2: Deploy (CD)
+# =============================================================================
+
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+
+    # Wait for build-and-scan to finish successfully before running.
+    # If CI fails (Trivy found CVEs, or the Docker build broke), this job
+    # is skipped entirely. Bad code cannot be deployed.
+    needs: build-and-scan
+
+    # Only deploy on direct pushes to main -- NOT on pull requests.
+    # PRs should be validated (CI) but never deployed.
+    # This is the "Continuous Delivery" model: only merged code ships.
+    # SSH_HOST guard: skip gracefully if VPS secrets haven't been added yet.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.SSH_HOST != ''
+
+    steps:
+
+      # SSH into the VPS and run:
+      #   1. docker pull  -> download the exact image that just passed CI
+      #   2. docker compose up -d -> restart container with the new commit SHA
+      #
+      # Required GitHub Secrets (repo -> Settings -> Secrets and variables -> Actions):
+      #   SSH_HOST        -> Your VPS IP address or domain (e.g. 123.45.67.89)
+      #   SSH_USER        -> SSH username on the VPS (e.g. ubuntu, root, deploy)
+      #   SSH_PRIVATE_KEY -> The full private key (~/.ssh/id_rsa or id_ed25519)
+      #                      that has access to the VPS
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # NOTE: Adjust /opt/heatnote to wherever docker-compose.prod.yml lives on your VPS.
+          script: |
+            IMAGE_NAME=$(echo "ghcr.io/${{ github.repository_owner }}/heatnote" | tr '[:upper:]' '[:lower:]')
+            docker pull "${IMAGE_NAME}:${{ github.sha }}"
+            HEATNOTE_TAG=${{ github.sha }} docker compose -f /opt/heatnote/docker-compose.prod.yml up -d
+            echo "Successfully deployed HeatNote commit: ${{ github.sha }}"
+

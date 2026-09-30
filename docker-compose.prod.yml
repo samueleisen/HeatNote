@@ -1,0 +1,42 @@
+# docker-compose.prod.yml -- Production launcher for HeatNote (runs on VPS)
+#
+# This file lives on your VPS at /opt/heatnote/docker-compose.prod.yml
+# It is the ONLY compose file needed on the server.
+#
+# Key difference from docker-compose.yml (local dev):
+#   Local:       build: .          <- builds the image from your source code
+#   Production:  image: ghcr.io/.. <- pulls a pre-built, pre-scanned image
+#
+# The server never builds anything. It only pulls and runs.
+# The image was already built and scanned by CI before it was pushed to GHCR.
+#
+# Usage on VPS:
+#   docker compose -f docker-compose.prod.yml up -d     <- start (or restart with new image)
+#   docker compose -f docker-compose.prod.yml down      <- stop
+#   docker compose -f docker-compose.prod.yml logs -f   <- stream live logs
+
+services:
+  app:
+    # Pull the image from GitHub Container Registry.
+    # Defaults to :latest, or uses HEATNOTE_TAG env var injected by the CD pipeline.
+    image: ghcr.io/samueleisen/heatnote:${HEATNOTE_TAG:-latest}
+
+    # ports: HOST_PORT:CONTAINER_PORT
+    # Nginx inside the container listens on port 80.
+    # The VPS exposes it on port 80 (standard HTTP).
+    # If you set up a reverse proxy (Nginx/Caddy) on the VPS, change this to 127.0.0.1:8080:80
+    ports:
+      - "80:80"
+
+    # Auto-restart if the container crashes or the VPS reboots.
+    restart: unless-stopped
+
+    # Docker periodically checks the /healthz endpoint.
+    # If it fails 3 times in a row, Docker marks the container unhealthy.
+    # Orchestrators and monitoring tools can then react automatically.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
