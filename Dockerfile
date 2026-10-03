@@ -1,4 +1,4 @@
-﻿# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Dockerfile - Builds a production container image for HeatNote
 # -----------------------------------------------------------------------------
 # A Dockerfile is a recipe. Docker reads it top-to-bottom and produces an
@@ -41,12 +41,9 @@ COPY mobile.js         /usr/share/nginx/html/
 COPY style.css         /usr/share/nginx/html/
 COPY fav-icon.png      /usr/share/nginx/html/
 
-# NOTE: firebase-config.js and cloudinary.js are in .gitignore (not in the repo)
-# but they ARE needed in the Docker image to run the app.
-# In CI, they are recreated from GitHub Secrets before docker build runs.
-# This is an intentional distinction: gitignored != dockerignored.
-COPY firebase-config.js /usr/share/nginx/html/
-COPY cloudinary.js      /usr/share/nginx/html/
+# All application source files have been copied above.
+# firebase-config.js and cloudinary.js have been removed --
+# authentication and media uploads are now handled by the local backend service.
 
 # EXPOSE: Documents which port this container listens on.
 # This is metadata only - it doesn't actually open any port.

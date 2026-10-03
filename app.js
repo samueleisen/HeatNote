@@ -1,15 +1,11 @@
-import {
-  auth,
-  database,
-  googleProvider,
-  ref,
-  set,
-  get,
-  onValue,
-  signInWithPopup,
-  signOut,
-  onAuthStateChanged,
-} from './firebase-config.js';
+// =============================================================================
+// Backend Client — Local Docker API
+// =============================================================================
+// All persistence and auth now go through the local backend service at /api/*.
+// Firebase and Cloudinary have been removed.
+// The constants below point to the backend container via Nginx reverse proxy.
+// =============================================================================
+const API_BASE = '/api';
 
 // --- Constants & Config ---
 const STORAGE_KEY_NOTES = 'customnote_notes_v1';
@@ -845,10 +841,19 @@ function workspaceKey(dateStr) {
       bodyEl.appendChild(p);
     }
 
-    // 2. Upload to Cloudinary in background
+    // 2. Upload to local backend in background
+    // TODO(backend): POST /api/upload accepts multipart/form-data and returns { url }
     try {
-      if (typeof uploadToCloudinary === 'function') {
-        const uploadResult = await uploadToCloudinary(file);
+      if (state.currentUser) {
+        const formData = new FormData();
+        formData.append('file', file);
+        const res = await fetch(`${API_BASE}/upload`, {
+          method: 'POST',
+          body: formData,
+          credentials: 'include',
+        });
+        if (!res.ok) throw new Error(`Upload API ${res.status}`);
+        const uploadResult = await res.json();
         if (uploadResult && uploadResult.url) {
           imgEl.src = uploadResult.url;
           imgEl.classList.remove('uploading');
@@ -862,9 +867,9 @@ function workspaceKey(dateStr) {
           return;
         }
       }
-      throw new Error('Cloudinary upload function not available');
+      throw new Error('Backend upload unavailable or user not signed in');
     } catch (err) {
-      console.warn('Cloudinary upload failed, falling back to local compressed image:', err);
+      console.warn('Backend upload failed, falling back to local compressed image:', err);
       compressAndFallbackImage(file, imgEl, previewUrl, targetId, bodyEl);
     }
   }
@@ -2052,7 +2057,7 @@ function workspaceKey(dateStr) {
   });
 
   // ==========================================
-  // Persistence (LocalStorage & Firebase Realtime Cloud Sync)
+  // Persistence (LocalStorage & Backend API Sync)
   // ==========================================
   function updateSyncStatus(status) {
     if (!syncStatus) return;
@@ -2150,14 +2155,18 @@ function workspaceKey(dateStr) {
     if (cloudSaveDebounceTimer && pendingCloudPayload && pendingCloudDate && state.currentUser) {
       clearTimeout(cloudSaveDebounceTimer);
       cloudSaveDebounceTimer = null;
-      const uid = state.currentUser.uid;
       const targetDate = pendingCloudDate;
       const payload = pendingCloudPayload;
       pendingCloudPayload = null;
       pendingCloudDate = null;
-      const workspaceRef = ref(database, `users/${uid}/workspaces/${targetDate}`);
-      set(workspaceRef, payload).catch((err) => {
-        console.error('Flush cloud save error:', err);
+      // TODO(backend): flush pending save to local API
+      fetch(`${API_BASE}/workspaces/${encodeURIComponent(targetDate)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        credentials: 'include',
+      }).catch((err) => {
+        console.error('Flush API save error:', err);
       });
       updateSyncStatus('synced');
     }
@@ -2254,18 +2263,23 @@ function workspaceKey(dateStr) {
     clearTimeout(cloudSaveDebounceTimer);
     cloudSaveDebounceTimer = setTimeout(async () => {
       if (!state.currentUser || !pendingCloudPayload) return;
-      const uid = state.currentUser.uid;
       const payloadToSend = pendingCloudPayload;
       const targetDateToSend = pendingCloudDate;
       pendingCloudPayload = null;
       pendingCloudDate = null;
       cloudSaveDebounceTimer = null;
       try {
-        const workspaceRef = ref(database, `users/${uid}/workspaces/${targetDateToSend}`);
-        await set(workspaceRef, payloadToSend);
+        // TODO(backend): save workspace to local API
+        const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(targetDateToSend)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadToSend),
+          credentials: 'include',
+        });
+        if (!res.ok) throw new Error(`API ${res.status}`);
         updateSyncStatus('synced');
       } catch (err) {
-        console.error('Firebase cloud save error:', err);
+        console.error('API cloud save error:', err);
         updateSyncStatus('error');
       }
     }, 600);
@@ -2317,9 +2331,13 @@ function workspaceKey(dateStr) {
     const arr = Array.from(state.customBoards);
     localStorage.setItem(STORAGE_KEY_CUSTOM_BOARDS, JSON.stringify(arr));
     if (state.currentUser) {
-      const uid = state.currentUser.uid;
-      const refBoards = ref(database, `users/${uid}/custom_boards`);
-      set(refBoards, arr).catch((err) => console.error('Save custom boards error:', err));
+      // TODO(backend): persist custom boards list to local API
+      fetch(`${API_BASE}/boards`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(arr),
+        credentials: 'include',
+      }).catch((err) => console.error('Save custom boards API error:', err));
     }
   }
 
@@ -2405,11 +2423,13 @@ function workspaceKey(dateStr) {
     // Step 3: Wipe local storage for this board.
     localStorage.removeItem(workspaceKey(name));
 
-    // Step 4: Wipe the workspace from Firebase.
+    // Step 4: Delete the workspace from the local API.
     if (state.currentUser) {
-      const uid = state.currentUser.uid;
-      const refWs = ref(database, `users/${uid}/workspaces/${name}`);
-      set(refWs, null).catch(() => {});
+      // TODO(backend): delete workspace from local API
+      fetch(`${API_BASE}/workspaces/${encodeURIComponent(name)}`, {
+        method: 'DELETE',
+        credentials: 'include',
+      }).catch(() => {});
     }
 
     renderCustomBoardsList();
@@ -2458,23 +2478,17 @@ function workspaceKey(dateStr) {
     }
     keysToRemove.forEach((k) => localStorage.removeItem(k));
 
-    // 2. Purge from Firebase Realtime Database if signed in
+    // 2. Purge expired workspaces from the local API if signed in
     if (state.currentUser) {
-      const uid = state.currentUser.uid;
       try {
-        const workspacesRef = ref(database, `users/${uid}/workspaces`);
-        const snapshot = await get(workspacesRef);
-        if (snapshot.exists()) {
-          const cloudWorkspaces = snapshot.val();
-          for (const dateKey of Object.keys(cloudWorkspaces)) {
-            if (/^\d{4}-\d{2}-\d{2}$/.test(dateKey) && dateKey < cutoffDate) {
-              const expiredRef = ref(database, `users/${uid}/workspaces/${dateKey}`);
-              await set(expiredRef, null); // Deletes expired node from Firebase
-            }
-          }
-        }
+        // TODO(backend): trigger server-side pruning of workspaces older than cutoffDate
+        const res = await fetch(`${API_BASE}/workspaces?before=${encodeURIComponent(cutoffDate)}`, {
+          method: 'DELETE',
+          credentials: 'include',
+        });
+        if (!res.ok) throw new Error(`API ${res.status}`);
       } catch (err) {
-        console.error('Error pruning expired cloud workspaces:', err);
+        console.error('Error pruning expired API workspaces:', err);
       }
     }
 
@@ -2564,24 +2578,37 @@ function workspaceKey(dateStr) {
   }
 
   // ==========================================
-  // Cloud Real-Time Sync (onValue)
+  // Backend Sync (Polling — replaces Firebase onValue)
   // ==========================================
+  // TODO(backend): Replace this polling stub with a proper SSE or WebSocket
+  // subscription once the backend service is wired up.
+  // For now, on date switch and login we do a single GET to resolve any conflict.
   function attachCloudListener(dateStr) {
-    // Detach any previous listener
+    // Detach any previous polling interval
     if (_activeCloudListener) {
-      _activeCloudListener();
+      clearInterval(_activeCloudListener);
       _activeCloudListener = null;
     }
 
     if (!state.currentUser) return;
-    const uid = state.currentUser.uid;
-    const workspaceRef = ref(database, `users/${uid}/workspaces/${dateStr}`);
 
-    _activeCloudListener = onValue(workspaceRef, (snapshot) => {
+    async function pollWorkspace() {
       if (isHydratingFromCloud) return;
-
-      if (snapshot.exists()) {
-        const cloudData = snapshot.val();
+      try {
+        // TODO(backend): GET workspace from local API
+        const res = await fetch(`${API_BASE}/workspaces/${encodeURIComponent(dateStr)}`, {
+          credentials: 'include',
+        });
+        if (!res.ok) {
+          if (res.status === 404) {
+            // No server copy yet — push local if we have notes
+            if (state.notes.size > 0 && state.activeDate === dateStr) {
+              saveToStorage(dateStr, true);
+            }
+          }
+          return;
+        }
+        const cloudData = await res.json();
         const rawLocal = localStorage.getItem(workspaceKey(dateStr));
         let localData = null;
         if (rawLocal) {
@@ -2590,11 +2617,10 @@ function workspaceKey(dateStr) {
         const cloudTime = cloudData.updatedAt || 0;
         const localTime = localData ? (localData.updatedAt || 0) : 0;
 
-        // Strict timestamp resolution: cloud wins if newer or if no local cache exists
+        // Strict timestamp resolution: API wins if newer or if no local cache exists
         const cloudWins = cloudTime > localTime || !localData;
 
         if (cloudWins) {
-          // Cancel any pending local save debounce timers so they don't overwrite cloud state
           clearTimeout(saveDebounceTimer);
           clearTimeout(cloudSaveDebounceTimer);
           saveDebounceTimer = null;
@@ -2613,13 +2639,11 @@ function workspaceKey(dateStr) {
           if (state.activeDate === dateStr) {
             isHydratingFromCloud = true;
             applyWorkspaceData(mergedLocal);
-            // Mark content signature in sync with cloud data
             lastContentSignature = JSON.stringify({
               notes: mergedLocal.notes,
               drawings: mergedLocal.drawings,
             });
             updateTransform();
-            // Clear any timer that might have been queued by DOM events
             clearTimeout(saveDebounceTimer);
             saveDebounceTimer = null;
             isHydratingFromCloud = false;
@@ -2627,16 +2651,15 @@ function workspaceKey(dateStr) {
           window.ActivityTracker?.refresh();
           updateSyncStatus('synced');
         }
-      } else {
-        // Cloud has nothing yet for this date — if local has notes, push them up
-        if (state.notes.size > 0 && state.activeDate === dateStr) {
-          saveToStorage(dateStr, true);
-        }
+      } catch (err) {
+        console.error('API poll error:', err);
+        updateSyncStatus('error');
       }
-    }, (err) => {
-      console.error('Cloud listener error:', err);
-      updateSyncStatus('error');
-    });
+    }
+
+    // Run once immediately on attach, then poll every 30 seconds
+    pollWorkspace();
+    _activeCloudListener = setInterval(pollWorkspace, 30000);
   }
 
   function applyWorkspaceData(workspace) {
@@ -2722,20 +2745,29 @@ function workspaceKey(dateStr) {
   }
 
   // ==========================================
-  // Firebase Authentication & Session
+  // Backend Authentication & Session
   // ==========================================
+  // TODO(backend): Replace these stubs with real calls to the backend /api/auth/* endpoints.
+  // Currently this checks /api/auth/me on load to restore session, and calls
+  // /api/auth/login + /api/auth/logout for the sign-in/sign-out buttons.
   function setupAuth() {
     if (googleLoginBtn) {
       googleLoginBtn.addEventListener('click', async () => {
         try {
           googleLoginBtn.disabled = true;
-          await signInWithPopup(auth, googleProvider);
-        } catch (err) {
-          console.error('Google Sign-In error:', err);
-        } finally {
-          if (googleLoginBtn) {
-            googleLoginBtn.disabled = false;
+          // TODO(backend): redirect to /api/auth/google or show login modal
+          const res = await fetch(`${API_BASE}/auth/login`, {
+            method: 'POST',
+            credentials: 'include',
+          });
+          if (res.ok) {
+            const user = await res.json();
+            await _onUserSignedIn(user);
           }
+        } catch (err) {
+          console.error('Sign-In error:', err);
+        } finally {
+          if (googleLoginBtn) googleLoginBtn.disabled = false;
         }
       });
     }
@@ -2743,7 +2775,17 @@ function workspaceKey(dateStr) {
     if (googleLogoutBtn) {
       googleLogoutBtn.addEventListener('click', async () => {
         try {
-          await signOut(auth);
+          await fetch(`${API_BASE}/auth/logout`, {
+            method: 'POST',
+            credentials: 'include',
+          });
+          state.currentUser = null;
+          // Detach polling interval
+          if (_activeCloudListener) {
+            clearInterval(_activeCloudListener);
+            _activeCloudListener = null;
+          }
+          updateAuthUI(null);
           updateSyncStatus('offline');
         } catch (err) {
           console.error('Sign-Out error:', err);
@@ -2751,124 +2793,132 @@ function workspaceKey(dateStr) {
       });
     }
 
-    onAuthStateChanged(auth, async (user) => {
-      state.currentUser = user;
-      updateAuthUI(user);
+    // On page load: check if a session already exists
+    _restoreSession();
+  }
 
-      if (user) {
-        updateSyncStatus('syncing');
-        try {
-          // 1. Fetch all user workspaces from cloud to hydrate local storage & activity strip
-          const workspacesRef = ref(database, `users/${user.uid}/workspaces`);
-          const snap = await get(workspacesRef);
-
-          if (snap.exists()) {
-            const allWorkspaces = snap.val();
-            const countsMap = {};
-            const colorsMap = {};
-            const titlesMap = {};
-            for (const [dateKey, ws] of Object.entries(allWorkspaces)) {
-              if (ws && typeof ws === 'object') {
-                if (/^\d{4}-\d{2}-\d{2}$/.test(dateKey) && Array.isArray(ws.notes)) {
-                  countsMap[dateKey] = ws.notes.length;
-                  for (const n of ws.notes) {
-                    const txt = n.content || '';
-                    if (!colorsMap[dateKey]) {
-                      if (/\\red\b/i.test(txt)) colorsMap[dateKey] = 'red';
-                      else if (/\\green\b/i.test(txt)) colorsMap[dateKey] = 'green';
-                      else if (/\\(purple|darkpurple)\b/i.test(txt)) colorsMap[dateKey] = 'purple';
-                      else if (/\\(yellow|gold)\b/i.test(txt)) colorsMap[dateKey] = 'yellow';
-                    }
-                    if (!titlesMap[dateKey]) {
-                      const clean = txt.replace(/<[^>]+>/g, ' ');
-                      const match = clean.match(/\\title\s+([^\n\r<]+)/i);
-                      if (match && match[1].trim()) {
-                        titlesMap[dateKey] = match[1].trim();
-                      }
-                    }
-                  }
-                }
-                const rawLocal = localStorage.getItem(workspaceKey(dateKey));
-                let localData = null;
-                if (rawLocal) {
-                  try { localData = JSON.parse(rawLocal); } catch {}
-                }
-                const cloudTime = ws.updatedAt || 0;
-                const localTime = localData ? (localData.updatedAt || 0) : 0;
-                // Strict timestamp comparison
-                if (cloudTime >= localTime || !localData) {
-                  const mergedLocal = {
-                    date: dateKey,
-                    notes: ws.notes || [],
-                    drawings: ws.drawings || [],
-                    updatedAt: cloudTime,
-                  };
-                  localStorage.setItem(workspaceKey(dateKey), JSON.stringify(mergedLocal));
-                }
-              }
-            }
-            window.ActivityTracker?.setActivityCounts(countsMap);
-            window.ActivityTracker?.setActivityColors(colorsMap);
-            window.ActivityTracker?.setActivityTitles(titlesMap);
-          }
-
-          // 1.5 Fetch custom boards list from cloud
-          try {
-            const customBoardsRef = ref(database, `users/${user.uid}/custom_boards`);
-            const customBoardsSnap = await get(customBoardsRef);
-            if (customBoardsSnap.exists()) {
-              const list = customBoardsSnap.val();
-              if (Array.isArray(list)) {
-                list.forEach((b) => {
-                  if (typeof b === 'string' && b.trim()) {
-                    state.customBoards.add(b.trim().toLowerCase());
-                  }
-                });
-                saveCustomBoards();
-                renderCustomBoardsList();
-              }
-            }
-          } catch (cbErr) {
-            console.error('Custom boards cloud hydration error:', cbErr);
-          }
-
-          // 2. Refresh activity strip and attach real-time live listener for active date
-          window.ActivityTracker?.refresh();
-          // Load active date data if cloud updated it
-          const rawActive = localStorage.getItem(workspaceKey(state.activeDate));
-          if (rawActive) {
-            try {
-              const activeWs = JSON.parse(rawActive);
-              if (activeWs) {
-                isHydratingFromCloud = true;
-                applyWorkspaceData(activeWs);
-                lastContentSignature = JSON.stringify({
-                  notes: activeWs.notes || [],
-                  drawings: activeWs.drawings || [],
-                });
-                updateTransform();
-                clearTimeout(saveDebounceTimer);
-                saveDebounceTimer = null;
-                isHydratingFromCloud = false;
-              }
-            } catch {}
-          }
-          attachCloudListener(state.activeDate);
-          await pruneExpiredWorkspaces();
-          updateSyncStatus('synced');
-        } catch (err) {
-          console.error('Initial user cloud hydration error:', err);
-          updateSyncStatus('error');
-        }
+  async function _restoreSession() {
+    try {
+      // TODO(backend): GET /api/auth/me — returns user object if session cookie is valid, 401 if not
+      const res = await fetch(`${API_BASE}/auth/me`, { credentials: 'include' });
+      if (res.ok) {
+        const user = await res.json();
+        await _onUserSignedIn(user);
       } else {
-        // Signed out — detach live listener
-        if (_activeCloudListener) {
-          _activeCloudListener();
-          _activeCloudListener = null;
-        }
+        updateAuthUI(null);
         updateSyncStatus('offline');
       }
-    });
+    } catch {
+      // Backend not yet running — app still works fully offline via localStorage
+      updateAuthUI(null);
+      updateSyncStatus('offline');
+    }
+  }
+
+  async function _onUserSignedIn(user) {
+    state.currentUser = user;
+    updateAuthUI(user);
+    updateSyncStatus('syncing');
+    try {
+      // 1. Fetch all workspaces from API to hydrate localStorage & activity strip
+      // TODO(backend): GET /api/workspaces returns array of all workspace summaries
+      const res = await fetch(`${API_BASE}/workspaces`, { credentials: 'include' });
+      if (res.ok) {
+        const allWorkspaces = await res.json(); // expected: [{ date, notes, drawings, updatedAt }]
+        const countsMap = {};
+        const colorsMap = {};
+        const titlesMap = {};
+        for (const ws of allWorkspaces) {
+          const dateKey = ws.date;
+          if (!ws || typeof ws !== 'object') continue;
+          if (/^\d{4}-\d{2}-\d{2}$/.test(dateKey) && Array.isArray(ws.notes)) {
+            countsMap[dateKey] = ws.notes.length;
+            for (const n of ws.notes) {
+              const txt = n.content || '';
+              if (!colorsMap[dateKey]) {
+                if (/\\red\b/i.test(txt)) colorsMap[dateKey] = 'red';
+                else if (/\\green\b/i.test(txt)) colorsMap[dateKey] = 'green';
+                else if (/\\(purple|darkpurple)\b/i.test(txt)) colorsMap[dateKey] = 'purple';
+                else if (/\\(yellow|gold)\b/i.test(txt)) colorsMap[dateKey] = 'yellow';
+              }
+              if (!titlesMap[dateKey]) {
+                const clean = txt.replace(/<[^>]+>/g, ' ');
+                const match = clean.match(/\\title\s+([^\n\r<]+)/i);
+                if (match && match[1].trim()) {
+                  titlesMap[dateKey] = match[1].trim();
+                }
+              }
+            }
+          }
+          // Merge cloud into localStorage (cloud wins if newer)
+          const rawLocal = localStorage.getItem(workspaceKey(dateKey));
+          let localData = null;
+          if (rawLocal) {
+            try { localData = JSON.parse(rawLocal); } catch {}
+          }
+          const cloudTime = ws.updatedAt || 0;
+          const localTime = localData ? (localData.updatedAt || 0) : 0;
+          if (cloudTime >= localTime || !localData) {
+            localStorage.setItem(workspaceKey(dateKey), JSON.stringify({
+              date: dateKey,
+              notes: ws.notes || [],
+              drawings: ws.drawings || [],
+              updatedAt: cloudTime,
+            }));
+          }
+        }
+        window.ActivityTracker?.setActivityCounts(countsMap);
+        window.ActivityTracker?.setActivityColors(colorsMap);
+        window.ActivityTracker?.setActivityTitles(titlesMap);
+      }
+
+      // 1.5 Fetch custom boards list from API
+      try {
+        // TODO(backend): GET /api/boards returns string array of board names
+        const boardsRes = await fetch(`${API_BASE}/boards`, { credentials: 'include' });
+        if (boardsRes.ok) {
+          const list = await boardsRes.json();
+          if (Array.isArray(list)) {
+            list.forEach((b) => {
+              if (typeof b === 'string' && b.trim()) {
+                state.customBoards.add(b.trim().toLowerCase());
+              }
+            });
+            saveCustomBoards();
+            renderCustomBoardsList();
+          }
+        }
+      } catch (cbErr) {
+        console.error('Custom boards API hydration error:', cbErr);
+      }
+
+      // 2. Re-apply active date data if API has a newer version
+      window.ActivityTracker?.refresh();
+      const rawActive = localStorage.getItem(workspaceKey(state.activeDate));
+      if (rawActive) {
+        try {
+          const activeWs = JSON.parse(rawActive);
+          if (activeWs) {
+            isHydratingFromCloud = true;
+            applyWorkspaceData(activeWs);
+            lastContentSignature = JSON.stringify({
+              notes: activeWs.notes || [],
+              drawings: activeWs.drawings || [],
+            });
+            updateTransform();
+            clearTimeout(saveDebounceTimer);
+            saveDebounceTimer = null;
+            isHydratingFromCloud = false;
+          }
+        } catch {}
+      }
+      attachCloudListener(state.activeDate);
+      await pruneExpiredWorkspaces();
+      updateSyncStatus('synced');
+    } catch (err) {
+      console.error('Initial user API hydration error:', err);
+      updateSyncStatus('error');
+    }
   }
 
   function updateAuthUI(user) {
@@ -2878,11 +2928,12 @@ function workspaceKey(dateStr) {
       authLoggedOut.classList.add('hidden');
       authLoggedIn.classList.remove('hidden');
 
+      // user object shape from /api/auth/me: { id, name, email, avatarUrl }
       if (userAvatar) {
-        userAvatar.src = user.photoURL || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="%236366f1"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg>';
+        userAvatar.src = user.avatarUrl || user.photoURL || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="%236366f1"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg>';
       }
       if (userName) {
-        userName.textContent = user.displayName || 'Google User';
+        userName.textContent = user.name || user.displayName || 'User';
       }
       if (userEmail) {
         userEmail.textContent = user.email || '';

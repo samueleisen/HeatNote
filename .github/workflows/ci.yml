@@ -1,24 +1,15 @@
 # =============================================================================
-# ci.yml -- CI/CD Pipeline for HeatNote
+# ci.yml -- CI Pipeline for HeatNote
 # =============================================================================
-# This file defines two jobs:
+# Runs on every push AND pull request to main.
+# Builds the Docker image and scans it with Trivy for CVEs.
 #
-#   1. build-and-scan  (CI)
-#      Runs on every push AND every pull request to main.
-#      Builds the Docker image, scans it with Trivy, and if clean,
-#      pushes it to GitHub Container Registry (GHCR).
-#
-#   2. deploy  (CD)
-#      Runs ONLY on direct pushes to main (not on PRs).
-#      Waits for build-and-scan to succeed, then SSHes into the VPS
-#      and tells it to pull the new image and restart the container.
-#
-# The split is intentional:
-#   - PRs get validated (CI) but never deployed.
-#   - Only code that lands on main gets shipped.
+# NOTE: GHCR push and VPS/SSH deploy steps have been removed.
+# HeatNote now runs as a local Docker Compose stack.
+# No secrets need to be injected at build time.
 # =============================================================================
 
-name: CI/CD Pipeline
+name: CI Pipeline
 
 on:
   push:
@@ -26,13 +17,11 @@ on:
   pull_request:
     branches: [main]
 
-# Permissions required for GITHUB_TOKEN to push container images to GHCR
 permissions:
   contents: read
-  packages: write
 
 # =============================================================================
-# Job 1: Build & Security Scan (CI)
+# Job: Build & Security Scan
 # =============================================================================
 jobs:
 
@@ -46,38 +35,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2: Recreate gitignored config files from GitHub Secrets.
-      # firebase-config.js and cloudinary.js contain API keys -- they are
-      # never committed to git, but the Dockerfile needs them at build time.
-      # Store the file contents as secrets in:
-      #   GitHub repo -> Settings -> Secrets and variables -> Actions
-      - name: Restore gitignored config files from secrets
-        env:
-          FIREBASE_CONFIG: ${{ secrets.FIREBASE_CONFIG_JS }}
-          CLOUDINARY_CONFIG: ${{ secrets.CLOUDINARY_JS }}
-        run: |
-          echo "$FIREBASE_CONFIG" > firebase-config.js
-          echo "$CLOUDINARY_CONFIG" > cloudinary.js
-
-      # Step 3: Log in to GitHub Container Registry (GHCR).
-      # GITHUB_TOKEN is an automatic secret -- GitHub provides it for free on
-      # every run. No manual setup needed. It expires when the job ends.
-      # Format: ghcr.io/GITHUB_USERNAME/REPO_NAME
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Step 4: Set up Docker Buildx -- the modern Docker build engine.
+      # Step 2: Set up Docker Buildx -- the modern Docker build engine.
       # Supports multi-platform builds and better layer caching vs the old builder.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Step 5: Build the Docker image.
-      # push: false  -> build and load into local Docker daemon, do NOT push yet.
-      #                 We scan it first. Bad images must never reach the registry.
+      # Step 3: Build the Docker image.
+      # push: false  -> build and load into local Docker daemon only.
       # load: true   -> makes the image available to the next step (Trivy scan).
       # tags         -> github.sha is the full 40-char commit hash.
       #                 Every image is uniquely traceable to the exact code version.
@@ -89,11 +53,11 @@ jobs:
           load: true
           tags: heatnote:${{ github.sha }}
 
-      # Step 6: Scan the built image for known CVEs using Trivy (Aqua Security).
+      # Step 4: Scan the built image for known CVEs using Trivy (Aqua Security).
       # exit-code: 1  -> FAIL the pipeline if vulnerabilities are found.
-      #                  This is the security gate -- bad images cannot proceed.
+      #                   This is the security gate -- bad images cannot proceed.
       # severity      -> Only block on CRITICAL or HIGH.
-      #                  MEDIUM/LOW are still reported but do not stop deployment.
+      #                   MEDIUM/LOW are still reported but do not stop deployment.
       - name: Run Trivy vulnerability scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -101,81 +65,3 @@ jobs:
           format: table
           exit-code: 1
           severity: CRITICAL,HIGH
-
-      # Step 7: Tag and push vetted image to GHCR.
-      # Runs ONLY on direct pushes to main (never on PRs).
-      # Two tags are pushed:
-      #   :<commit-sha> -> permanent, unique, traceable to the exact commit
-      #   :latest       -> always points to the most recent successful build on main
-      # Note: Docker repository names MUST be strictly lowercase.
-      - name: Tag and push image to GHCR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          IMAGE_NAME=$(echo "ghcr.io/${{ github.repository_owner }}/heatnote" | tr '[:upper:]' '[:lower:]')
-          docker tag heatnote:${{ github.sha }} "${IMAGE_NAME}:${{ github.sha }}"
-          docker tag heatnote:${{ github.sha }} "${IMAGE_NAME}:latest"
-          docker push "${IMAGE_NAME}:${{ github.sha }}"
-          docker push "${IMAGE_NAME}:latest"
-
-# =============================================================================
-# Job 2: Deploy (CD) -- DISABLED until AWS VPS is ready
-# =============================================================================
-# HOW TO ENABLE when your AWS EC2 instance is set up:
-#
-#   Step 1 -- GitHub repo -> Settings -> Variables -> Actions -> New variable:
-#               Name:  DEPLOY_ENABLED
-#               Value: true
-#
-#   Step 2 -- GitHub repo -> Settings -> Secrets -> Actions -> Add these 3 secrets:
-#               SSH_HOST        -> Your EC2 public IP or domain (e.g. 13.250.x.x)
-#               SSH_USER        -> ubuntu  (default AWS EC2 user for Ubuntu AMI)
-#               SSH_PRIVATE_KEY -> Contents of your ~/.ssh/heatnote_deploy private key
-#
-#   Step 3 -- On your EC2 instance, place docker-compose.prod.yml at /opt/heatnote/
-#               mkdir -p /opt/heatnote
-#               # copy docker-compose.prod.yml there (scp or paste manually)
-#
-#   Step 4 -- Uncomment the entire deploy job block below (remove the leading #)
-#
-# WHY vars.DEPLOY_ENABLED and not secrets.SSH_HOST:
-#   GitHub Actions does NOT allow the `secrets` context in job-level `if:` conditions.
-#   It IS allowed in step-level `if:` and `run:` blocks.
-#   The `vars` context (non-sensitive config flags) IS available at job level.
-#   So we use a vars flag as the gate, and secrets only inside the steps.
-# =============================================================================
-
-#  deploy:
-#    name: Deploy to VPS
-#    runs-on: ubuntu-latest
-#
-#    # Wait for build-and-scan to pass. If CI fails, this job is skipped entirely.
-#    needs: build-and-scan
-#
-#    # Only deploy on direct pushes to main (not PRs).
-#    # vars.DEPLOY_ENABLED must be set to 'true' in GitHub repo Variables.
-#    # See HOW TO ENABLE checklist above.
-#    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
-#
-#    steps:
-#
-#      # SSH into the EC2 instance and:
-#      #   1. docker pull  -> download the exact image that just passed CI from GHCR
-#      #   2. docker compose up -d -> restart container with the new image
-#      #
-#      # Required GitHub Secrets:
-#      #   SSH_HOST        -> EC2 public IP or domain
-#      #   SSH_USER        -> ubuntu (default for AWS Ubuntu AMI)
-#      #   SSH_PRIVATE_KEY -> Private key with access to the EC2 instance
-#      - name: Deploy via SSH
-#        uses: appleboy/ssh-action@v1.0.3
-#        with:
-#          host: ${{ secrets.SSH_HOST }}
-#          username: ${{ secrets.SSH_USER }}
-#          key: ${{ secrets.SSH_PRIVATE_KEY }}
-#          # Adjust /opt/heatnote if you placed docker-compose.prod.yml elsewhere on EC2.
-#          script: |
-#            IMAGE_NAME=$(echo "ghcr.io/${{ github.repository_owner }}/heatnote" | tr '[:upper:]' '[:lower:]')
-#            docker pull "${IMAGE_NAME}:${{ github.sha }}"
-#            HEATNOTE_TAG=${{ github.sha }} docker compose -f /opt/heatnote/docker-compose.prod.yml up -d
-#            echo "Successfully deployed HeatNote commit: ${{ github.sha }}"
-
