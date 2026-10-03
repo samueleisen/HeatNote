@@ -1,4 +1,4 @@
-﻿# docker-compose.yml -- Local development launcher for HeatNote
+# docker-compose.yml -- Local development launcher for HeatNote
 #
 # Instead of typing a long docker run command with ports and flags, run:
 #   docker compose up           <- builds image (if needed) and starts
@@ -7,6 +7,10 @@
 #   docker compose logs -f      <- stream live container logs
 
 services:
+
+  # ---------------------------------------------------------------------------
+  # Frontend — Nginx serves static HTML/JS/CSS and proxies /api/ to backend
+  # ---------------------------------------------------------------------------
   app:
     # build: look for a Dockerfile in the current directory and build from it
     build: .
@@ -20,6 +24,12 @@ services:
     # restart: auto-restart on crash or reboot, but not on manual docker compose down
     restart: unless-stopped
 
+    # app depends on backend being available for /api/ proxy to work.
+    # "service_started" means: wait for the container to start, not for it to be healthy.
+    depends_on:
+      backend:
+        condition: service_started
+
     # healthcheck: Docker periodically runs this to verify the container is healthy.
     # Ties into the /healthz location block defined in nginx.conf.
     healthcheck:
@@ -28,3 +38,38 @@ services:
       timeout: 5s      # fail if no response within 5 seconds
       retries: 3       # mark unhealthy after 3 consecutive failures
       start_period: 5s # grace period before first check
+
+  # ---------------------------------------------------------------------------
+  # Backend — Node.js API server with embedded SQLite
+  # ---------------------------------------------------------------------------
+  backend:
+    build: ./backend
+
+    # The backend is not exposed to the host directly.
+    # All traffic goes through Nginx (/api/* proxy).
+    # Port 3000 is only reachable within the Docker network.
+    expose:
+      - "3000"
+
+    # Mount a persistent Docker volume for the SQLite database and uploaded images.
+    # Even if the container is destroyed and rebuilt, data survives.
+    volumes:
+      - heatnote-data:/data
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# =============================================================================
+# Volumes — Persistent storage that survives container rebuilds
+# =============================================================================
+# Docker volumes are stored on your host filesystem (managed by Docker).
+# `docker volume ls` shows them, `docker volume inspect heatnote_heatnote-data`
+# shows the physical path on disk.
+volumes:
+  heatnote-data:

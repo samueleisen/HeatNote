@@ -1,4 +1,8 @@
 .env
+node_modules/
+backend/package-lock.json
 concern_continuing_CD.md
 phase3_cd_plan.md
 heatnote_devops_journey.md
+backend_integration.md
+backend_implementation.md
