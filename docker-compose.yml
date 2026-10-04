@@ -17,7 +17,7 @@ services:
 
     # ports: HOST_PORT:CONTAINER_PORT
     # Container listens on 80 (Nginx). Your machine exposes it on 8080.
-    # Visit: http://localhost:8080
+    # Visit: http://127.0.0.1:8080
     ports:
       - "8080:80"
 
@@ -33,7 +33,7 @@ services:
     # healthcheck: Docker periodically runs this to verify the container is healthy.
     # Ties into the /healthz location block defined in nginx.conf.
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/healthz"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
       interval: 30s    # check every 30 seconds
       timeout: 5s      # fail if no response within 5 seconds
       retries: 3       # mark unhealthy after 3 consecutive failures
@@ -59,7 +59,7 @@ services:
     restart: unless-stopped
 
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/healthz"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3000/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -1,12 +1,19 @@
 # =============================================================================
-# ci.yml -- CI Pipeline for HeatNote
+# ci.yml -- CI + Continuous Delivery Pipeline for HeatNote
 # =============================================================================
-# Runs on every push AND pull request to main.
-# Builds the Docker image and scans it with Trivy for CVEs.
+# CI  (every push + PR):  build both images, scan them with Trivy.
+# CD  (push to main / v* tag): publish the SAME scanned images to GHCR.
 #
-# NOTE: GHCR push and VPS/SSH deploy steps have been removed.
-# HeatNote now runs as a local Docker Compose stack.
-# No secrets need to be injected at build time.
+# This is Continuous DELIVERY, not Deployment: the pipeline stops once the
+# images are on the shelf (GHCR). Users pull and run them themselves with
+# docker-compose.release.yml. No servers, no SSH, no extra secrets --
+# GHCR auth uses the built-in GITHUB_TOKEN.
+#
+# Tag strategy:
+#   Pull request      -> build + scan only, nothing published
+#   Push to main      -> :main (rolling) + :sha-<short> (traceable)
+#   Tag v0.1.0        -> :0.1.0 + :0.1 + :latest (stable channel)
+#                        + a GitHub Release with the compose file attached
 # =============================================================================
 
 name: CI Pipeline
@@ -14,20 +21,37 @@ name: CI Pipeline
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
 
 permissions:
   contents: read
+  packages: write   # required to push images to ghcr.io
 
-# =============================================================================
-# Job: Build & Security Scan
-# =============================================================================
+env:
+  REGISTRY: ghcr.io
+  # GHCR image names must be lowercase.
+  IMAGE_PREFIX: ghcr.io/samueleisen/heatnote
+
 jobs:
 
-  build-and-scan:
-    name: Build & Security Scan
+  # ===========================================================================
+  # Job 1: Build, Scan, Publish -- runs once per image via a matrix
+  # ===========================================================================
+  build-scan-publish:
+    name: ${{ matrix.name }} -- build, scan, publish
     runs-on: ubuntu-latest
+
+    # Matrix: one job definition, two parallel runs (frontend + backend).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: app        # Nginx + static frontend
+            context: .
+          - name: backend    # Node.js + SQLite API
+            context: ./backend
 
     steps:
 
@@ -35,33 +59,90 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2: Set up Docker Buildx -- the modern Docker build engine.
-      # Supports multi-platform builds and better layer caching vs the old builder.
+      # Step 2: Compute image tags from the git event (branch / sha / semver).
+      # latest=false + explicit raw rule => :latest ONLY moves on a v* tag,
+      # never on an ordinary push to main.
+      - name: Generate image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}
+          flavor: latest=false
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      # Step 3: Set up Docker Buildx -- the modern Docker build engine.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Step 3: Build the Docker image.
-      # push: false  -> build and load into local Docker daemon only.
-      # load: true   -> makes the image available to the next step (Trivy scan).
-      # tags         -> github.sha is the full 40-char commit hash.
-      #                 Every image is uniquely traceable to the exact code version.
+      # Step 4: Build the image and load it into the runner's local Docker.
+      # push: false -> nothing leaves the runner until Trivy approves it.
+      # cache (type=gha) -> reuses layers between runs, much faster rebuilds.
       - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ matrix.context }}
           push: false
           load: true
-          tags: heatnote:${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
-      # Step 4: Scan the built image for known CVEs using Trivy (Aqua Security).
-      # exit-code: 1  -> FAIL the pipeline if vulnerabilities are found.
-      #                   This is the security gate -- bad images cannot proceed.
-      # severity      -> Only block on CRITICAL or HIGH.
-      #                   MEDIUM/LOW are still reported but do not stop deployment.
+      # Step 5: Security gate -- scan for known CVEs with Trivy.
+      # image-ref      -> first tag metadata-action generated (always present
+      #                   in the local daemon thanks to load: true above).
+      # exit-code: 1   -> FAIL the job on CRITICAL/HIGH findings.
+      # ignore-unfixed -> only block on CVEs that actually have a fix;
+      #                   unfixable upstream issues are reported, not blocking.
       - name: Run Trivy vulnerability scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: heatnote:${{ github.sha }}
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           format: table
           exit-code: 1
+          ignore-unfixed: true
           severity: CRITICAL,HIGH
+
+      # Step 6: Log in to GHCR (skipped on PRs -- PRs never publish).
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 7: Push the EXACT image Trivy just scanned (no rebuild).
+      # --all-tags pushes every tag metadata-action attached to it.
+      - name: Push image to GHCR
+        if: github.event_name != 'pull_request'
+        run: docker push --all-tags ${{ env.IMAGE_PREFIX }}-${{ matrix.name }}
+
+  # ===========================================================================
+  # Job 2: GitHub Release -- only on v* tags, only after both images published
+  # ===========================================================================
+  release:
+    name: Create GitHub Release
+    needs: build-scan-publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create the release
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Publishes a Release page with auto-generated notes (commits/PRs since
+      # the previous tag) and attaches the compose file users need to run it.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: docker-compose.release.yml

@@ -1,0 +1,60 @@
+# =============================================================================
+# docker-compose.release.yml -- Run HeatNote from pre-built images (no source)
+# =============================================================================
+# This is the file END USERS download. It never builds anything -- it pulls
+# the images that CI already built and security-scanned, published on GHCR.
+#
+# Quick start (any machine with Docker):
+#   curl -O https://raw.githubusercontent.com/samueleisen/HeatNote/main/docker-compose.release.yml
+#   docker compose -f docker-compose.release.yml up -d
+#   open http://127.0.0.1:8080
+#
+# Pin a version (recommended) or follow a channel:
+#   HEATNOTE_VERSION=0.1.0  docker compose -f docker-compose.release.yml up -d
+#   HEATNOTE_VERSION=main   ...   <- rolling build of the main branch
+#   (unset)                 ...   <- :latest = newest stable release
+#
+# Update to a newer version:
+#   docker compose -f docker-compose.release.yml pull
+#   docker compose -f docker-compose.release.yml up -d
+#
+# Change the port:  HEATNOTE_PORT=9000 docker compose -f ... up -d
+#
+# Developers working on the source should use docker-compose.yml instead.
+# =============================================================================
+
+services:
+
+  # Frontend -- Nginx serves the static app and proxies /api/ to backend
+  app:
+    image: ghcr.io/samueleisen/heatnote-app:${HEATNOTE_VERSION:-latest}
+    ports:
+      - "${HEATNOTE_PORT:-8080}:80"
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # Backend -- Node.js API + SQLite, only reachable through Nginx
+  backend:
+    image: ghcr.io/samueleisen/heatnote-backend:${HEATNOTE_VERSION:-latest}
+    expose:
+      - "3000"
+    volumes:
+      - heatnote-data:/data   # SQLite DB + uploaded images survive upgrades
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  heatnote-data:
